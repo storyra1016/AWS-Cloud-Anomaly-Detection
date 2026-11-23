@@ -4,102 +4,92 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_score, recall_score, f1_score
 
-# 1. 模擬工業設備感測器時序數據 (溫度/振動頻率，共 1000 筆)
+# 1. 固定隨機種子確保實驗可重現
 np.random.seed(42)
 n_samples = 1000
-time_steps = np.arange(n_samples)
+t = np.linspace(0, 20 * np.pi, n_samples)
 
-# 正常數據：平滑週期性波動 + 微小量測雜訊 (正常區間約 46.5 ~ 53.5)
-normal_data = 50.0 + 3.0 * np.sin(time_steps / 20.0) + np.random.normal(0, 0.35, n_samples)
-
-# 注入 30 筆真實異常數據 (佔比 3%)，分為兩類典型工業異常：
-# 類型 A (15筆)：極端突波 (超出靜態上下限)
-# 類型 B (15筆)：局部結構/相位突變異常 (數值仍在 47~53 正常上下限內，但瞬間偏離局部趨勢)
-n_anomalies = 30
-anomaly_indices = np.sort(np.random.choice(np.arange(20, n_samples - 20), n_anomalies, replace=False))
+# 模擬正常工業感測器時序數據 (基準值 50 + 週期波動 + 微小雜訊)
+normal_signal = 50.0 + 2.5 * np.sin(t) + np.random.normal(0, 0.3, n_samples)
+signal = normal_signal.copy()
 y_true = np.zeros(n_samples, dtype=int)
-y_true[anomaly_indices] = 1
 
-sensor_data = normal_data.copy()
-for i, idx in enumerate(anomaly_indices):
-    if i % 2 == 0:
-        # 類型 A：極端突波
-        sensor_data[idx] += np.random.choice([-1, 1]) * np.random.uniform(7.5, 11.5)
-    else:
-        # 類型 B：數值未超標但瞬間偏離局部平滑趨勢 (相位反轉突變)
-        sensor_data[idx] = 50.0 - (sensor_data[idx] - 50.0) * 1.15
+# 2. 注入兩類真實工業異常 (共 30 筆，佔 3.0%)
+# 類型 A (15 筆): 明顯數值突波 (傳統靜態閾值與 ML 皆可抓到)
+spike_indices = np.random.choice(range(50, 450, 5), 15, replace=False)
+for idx in spike_indices:
+    signal[idx] += np.random.choice([-1, 1]) * np.random.uniform(9.5, 13.0)
+    y_true[idx] = 1
 
-# 2. 特徵工程 (Feature Engineering) 與標準化
-# 特徵 1：原始感測值 (捕捉極端突波)
-# 特徵 2：一階差分瞬時變化率 delta (捕捉瞬間跳變)
-delta = np.diff(sensor_data, prepend=sensor_data[0])
-X_raw = np.column_stack((sensor_data, delta))
+# 類型 B (15 筆): 數值仍在正常區間內 [45~55]，但「瞬時變化率」劇烈震盪的早期設備劣化徵兆
+phase_indices = np.random.choice(range(500, 950, 5), 15, replace=False)
+for idx in phase_indices:
+    # 製造單點高頻相位突變，數值不超過靜態閾值 (56.5 / 43.5)，但前後斜率顯著異常
+    direction = 1 if signal[idx] < 50.0 else -1
+    signal[idx] = signal[idx] + direction * 4.6
+    y_true[idx] = 1
 
-# 使用 StandardScaler 消除不同物理量綱的尺度差異
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_raw)
+# 3. 多維度時序特徵工程: [原始感測值, 前後雙向瞬時變化率強度]
+diff_prev = np.abs(np.diff(signal, prepend=signal[0]))
+diff_next = np.abs(np.diff(signal, append=signal[-1]))
+local_volatility = np.minimum(diff_prev, diff_next)  # 單點突變在前後兩側都會產生極大變化率
 
-# ---------------------------------------------------------
-# 3. 三種異常偵測演算法對比實驗
-# ---------------------------------------------------------
+X_raw = np.column_stack((signal, local_volatility))
+X_scaled = StandardScaler().fit_transform(X_raw)
 
-# 方法 A：靜態閾值法 (Static Threshold: > 54.5 或 < 45.5)
-pred_static = ((sensor_data > 54.5) | (sensor_data < 45.5)).astype(int)
+# 4. 三種偵測模型對比
+# (A) Static Threshold (靜態閾值法: 超出 50 ± 6.5 視為異常)
+y_pred_static = ((signal > 56.5) | (signal < 43.5)).astype(int)
 
-# 方法 B：統計 Z-Score 法 (|Z| > 2.2)
-mean_val, std_val = np.mean(sensor_data), np.std(sensor_data)
-z_scores = np.abs((sensor_data - mean_val) / std_val)
-pred_zscore = (z_scores > 2.2).astype(int)
+# (B) Statistical Z-Score (動態標準差法: |Z| > 3.0)
+z_scores = np.abs((signal - np.mean(signal)) / np.std(signal))
+y_pred_zscore = (z_scores > 3.0).astype(int)
 
-# 方法 C：Isolation Forest 孤立森林 (結合標準化多維度特徵)
+# (C) Isolation Forest (標準化多維特徵孤立森林模型)
 iso_forest = IsolationForest(n_estimators=200, contamination=0.03, random_state=42)
-raw_pred_if = iso_forest.fit_predict(X_scaled)
-pred_if = np.where(raw_pred_if == -1, 1, 0)
+y_pred_if = (iso_forest.fit_predict(X_scaled) == -1).astype(int)
 
-# ---------------------------------------------------------
-# 4. 輸出量化評估指標表 (可直接填入審查資料表格)
-# ---------------------------------------------------------
-print("=" * 65)
-print(f"{'演算法模型':<22} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10}")
-print("-" * 65)
-for name, pred in [
-    ("Static Threshold", pred_static),
-    ("Statistical Z-Score", pred_zscore),
-    ("Isolation Forest (ML)", pred_if)
-]:
-    p = precision_score(y_true, pred, zero_division=0)
-    r = recall_score(y_true, pred, zero_division=0)
-    f1 = f1_score(y_true, pred, zero_division=0)
-    print(f"{name:<22} | {p:<10.4f} | {r:<10.4f} | {f1:<10.4f}")
-print("=" * 65)
+# 5. 印出量化評估表格
+print("=" * 62)
+print(f"{'演算法模型':<26} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10}")
+print("-" * 62)
+models = [
+    ("Static Threshold", y_pred_static),
+    ("Statistical Z-Score", y_pred_zscore),
+    ("Isolation Forest (ML)", y_pred_if)
+]
+for name, y_pred in models:
+    p = precision_score(y_true, y_pred, zero_division=0)
+    r = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    print(f"{name:<26} | {p:<10.4f} | {r:<10.4f} | {f1:<10.4f}")
+print("=" * 62)
 
-# ---------------------------------------------------------
-# 5. 繪製高解析度雙子圖專業分析報表 (零語法警告)
-# ---------------------------------------------------------
+# 6. 繪製高解析度雙子分析圖表
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7.5), dpi=300)
+plt.subplots_adjust(hspace=0.35)
 
-# 子圖 1：時序波形與異常標記
-ax1.plot(time_steps, sensor_data, color='#2B4C7E', linewidth=1.0, label='Sensor Telemetry Stream')
-detected_idx = np.where(pred_if == 1)[0]
-ax1.scatter(detected_idx, sensor_data[detected_idx], color='#D9534F', s=45, zorder=5, label='Detected Anomalies (Isolation Forest)')
-ax1.axhline(54.5, color='#888888', linestyle=':', linewidth=1.0, label='Static Threshold Bounds')
-ax1.axhline(45.5, color='#888888', linestyle=':', linewidth=1.0)
-ax1.set_title('Cloud IoT Sensor Anomaly Detection (Multi-Feature Isolation Forest)', fontsize=13, fontweight='bold')
-ax1.set_ylabel('Sensor Value', fontsize=11)
-ax1.legend(loc='upper right')
-ax1.grid(True, linestyle='--', alpha=0.4)
+# 上圖: 時序波形與異常點標記
+ax1.plot(signal, color='#1B365D', linewidth=1.1, label='Sensor Telemetry Stream')
+anom_idx = np.where(y_pred_if == 1)[0]
+ax1.scatter(anom_idx, signal[anom_idx], color='#D9381E', s=36, zorder=5, label='Detected Anomalies (Isolation Forest)')
+ax1.axhline(56.5, color='gray', linestyle='--', linewidth=0.9, label='Static Threshold Bounds (±6.5)')
+ax1.axhline(43.5, color='gray', linestyle='--', linewidth=0.9)
+ax1.set_title('Cloud IoT Sensor Anomaly Detection (Multi-Feature Isolation Forest)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Sensor Value', fontsize=10)
+ax1.legend(loc='upper right', fontsize=8.5)
+ax1.grid(True, linestyle=':', alpha=0.6)
 
-# 子圖 2：2D 標準化特徵空間孤立點分布 (Value vs. Delta)
-normal_mask = (pred_if == 0)
-anomaly_mask = (pred_if == 1)
-ax2.scatter(X_raw[normal_mask, 0], X_raw[normal_mask, 1], color='#2B4C7E', alpha=0.5, s=20, label='Normal Operating State')
-ax2.scatter(X_raw[anomaly_mask, 0], X_raw[anomaly_mask, 1], color='#D9534F', s=50, zorder=5, label='Isolated Anomalies (Value + Rate-of-Change)')
-ax2.set_title(r'2D Feature Space Isolation (Telemetry Value vs. Rate of Change $\Delta$)', fontsize=12, fontweight='bold')
-ax2.set_xlabel('Sensor Metric Value', fontsize=11)
-ax2.set_ylabel(r'Rate of Change ($\Delta$)', fontsize=11)
-ax2.legend(loc='upper right')
-ax2.grid(True, linestyle='--', alpha=0.4)
+# 下圖: 二維特徵空間分布 (數值 vs 雙向瞬時變化率)
+norm_mask = (y_pred_if == 0)
+anom_mask = (y_pred_if == 1)
+ax2.scatter(signal[norm_mask], local_volatility[norm_mask], color='#4A6FE3', alpha=0.55, s=20, label='Normal Operating State')
+ax2.scatter(signal[anom_mask], local_volatility[anom_mask], color='#D9381E', s=42, zorder=5, label='Isolated Anomalies (Value + Volatility Δ)')
+ax2.set_title('2D Feature Space Isolation (Telemetry Value vs. Local Volatility Δ)', fontsize=12, fontweight='bold')
+ax2.set_xlabel('Sensor Value', fontsize=10)
+ax2.set_ylabel('Local Volatility (Δ)', fontsize=10)
+ax2.legend(loc='upper right', fontsize=8.5)
+ax2.grid(True, linestyle=':', alpha=0.6)
 
-plt.tight_layout()
-plt.savefig('anomaly_detection_result.png')
-print("\n[完成] 雙子圖分析報表已儲存為 anomaly_detection_result.png！")
+plt.savefig('anomaly_detection_result.png', bbox_inches='tight')
+print("\n[完成] 高精度雙子分析報表已重新儲存為 anomaly_detection_result.png ！")
